@@ -41,6 +41,13 @@ public:
   ItaniumCXXABI(CodeGen::CodeGenModule &CGM, bool IsARM = false) :
     CGCXXABI(CGM), IsARM(IsARM) { }
 
+  void ErrorUnsupportedABIWithoutFunction(StringRef S) {
+    DiagnosticsEngine &Diags = CGM.getDiags();
+    unsigned DiagID = Diags.getCustomDiagID(DiagnosticsEngine::Error,
+      "cannot yet compile %0 in this ABI");
+    Diags.Report(DiagID) << S;
+  }
+
   bool isReturnTypeIndirect(const CXXRecordDecl *RD) const {
     // Structures with either a non-trivial destructor or a non-trivial
     // copy constructor are always indirect.
@@ -162,27 +169,21 @@ public:
       llvm::Function *InitFunc);
   LValue EmitThreadLocalDeclRefExpr(CodeGenFunction &CGF,
                                     const DeclRefExpr *DRE);
+
+  // Treeki's CW/PPC mod:
+  //   Moved HasThisReturn from ARM. Removed Dtor_Deleting check.
+
+  bool HasThisReturn(GlobalDecl GD) const {
+    const CXXMethodDecl *MD = dyn_cast_or_null<CXXMethodDecl>(GD.getDecl());
+    if (!MD) return false;
+    return (isa<CXXConstructorDecl>(MD) ||
+              isa<CXXDestructorDecl>(MD));
+  }
 };
 
 class ARMCXXABI : public ItaniumCXXABI {
 public:
   ARMCXXABI(CodeGen::CodeGenModule &CGM) : ItaniumCXXABI(CGM, /*ARM*/ true) {}
-
-  void BuildConstructorSignature(const CXXConstructorDecl *Ctor,
-                                 CXXCtorType T,
-                                 CanQualType &ResTy,
-                                 SmallVectorImpl<CanQualType> &ArgTys);
-
-  void BuildDestructorSignature(const CXXDestructorDecl *Dtor,
-                                CXXDtorType T,
-                                CanQualType &ResTy,
-                                SmallVectorImpl<CanQualType> &ArgTys);
-
-  void BuildInstanceFunctionParams(CodeGenFunction &CGF,
-                                   QualType &ResTy,
-                                   FunctionArgList &Params);
-
-  void EmitInstanceFunctionProlog(CodeGenFunction &CGF);
 
   void EmitReturnFromThunk(CodeGenFunction &CGF, RValue RV, QualType ResTy);
 
@@ -195,14 +196,8 @@ public:
   llvm::Value *readArrayCookieImpl(CodeGenFunction &CGF, llvm::Value *allocPtr,
                                    CharUnits cookieSize);
 
-  /// \brief Returns true if the given instance method is one of the
-  /// kinds that the ARM ABI says returns 'this'.
-  bool HasThisReturn(GlobalDecl GD) const {
-    const CXXMethodDecl *MD = dyn_cast_or_null<CXXMethodDecl>(GD.getDecl());
-    if (!MD) return false;
-    return ((isa<CXXDestructorDecl>(MD) && GD.getDtorType() != Dtor_Deleting) ||
-            (isa<CXXConstructorDecl>(MD)));
-  }
+  // Treeki's CW/PPC mod:
+  //   Moved HasThisReturn to Itanium.
 };
 }
 
@@ -233,7 +228,9 @@ llvm::Type *
 ItaniumCXXABI::ConvertMemberPointerType(const MemberPointerType *MPT) {
   if (MPT->isMemberDataPointer())
     return CGM.PtrDiffTy;
-  return llvm::StructType::get(CGM.PtrDiffTy, CGM.PtrDiffTy, NULL);
+  // Treeki's CW/PPC mod:
+  //   Added an extra field.
+  return llvm::StructType::get(CGM.PtrDiffTy, CGM.PtrDiffTy, CGM.PtrDiffTy, NULL);
 }
 
 /// In the Itanium and ARM ABIs, method pointers have the form:
@@ -272,19 +269,24 @@ ItaniumCXXABI::EmitLoadOfMemberFunctionPointer(CodeGenFunction &CGF,
     CGM.getTypes().GetFunctionType(
       CGM.getTypes().arrangeCXXMethodType(RD, FPT));
 
-  llvm::Constant *ptrdiff_1 = llvm::ConstantInt::get(CGM.PtrDiffTy, 1);
+  // llvm::Constant *ptrdiff_1 = llvm::ConstantInt::get(CGM.PtrDiffTy, 1);
 
   llvm::BasicBlock *FnVirtual = CGF.createBasicBlock("memptr.virtual");
   llvm::BasicBlock *FnNonVirtual = CGF.createBasicBlock("memptr.nonvirtual");
   llvm::BasicBlock *FnEnd = CGF.createBasicBlock("memptr.end");
 
-  // Extract memptr.adj, which is in the second field.
-  llvm::Value *RawAdj = Builder.CreateExtractValue(MemFnPtr, 1, "memptr.adj");
+  // Treeki's CW/PPC mod:
+  //   Totally reworked lots of this to work with CW's PTMFs.
 
-  // Compute the true adjustment.
-  llvm::Value *Adj = RawAdj;
-  if (IsARM)
-    Adj = Builder.CreateAShr(Adj, ptrdiff_1, "memptr.adj.shifted");
+  // CodeWarrior PPC PTMFs:
+  // first = "this" adjustment
+  // second = negative value OR offset within vtable
+  // third = static func ptr OR vtable ptr offset
+
+  // Extract memptr.adj, which is in the first field.
+  llvm::Value *Adj = Builder.CreateExtractValue(MemFnPtr, 0, "memptr.adj");
+  llvm::Value *OffsInVTable = Builder.CreateExtractValue(MemFnPtr, 1, "memptr.vtptroffset");
+  llvm::Value *FnAsInt = Builder.CreateExtractValue(MemFnPtr, 2, "memptr.ptr");
 
   // Apply the adjustment and cast back to the original struct type
   // for consistency.
@@ -292,17 +294,7 @@ ItaniumCXXABI::EmitLoadOfMemberFunctionPointer(CodeGenFunction &CGF,
   Ptr = Builder.CreateInBoundsGEP(Ptr, Adj);
   This = Builder.CreateBitCast(Ptr, This->getType(), "this.adjusted");
   
-  // Load the function pointer.
-  llvm::Value *FnAsInt = Builder.CreateExtractValue(MemFnPtr, 0, "memptr.ptr");
-  
-  // If the LSB in the function pointer is 1, the function pointer points to
-  // a virtual function.
-  llvm::Value *IsVirtual;
-  if (IsARM)
-    IsVirtual = Builder.CreateAnd(RawAdj, ptrdiff_1);
-  else
-    IsVirtual = Builder.CreateAnd(FnAsInt, ptrdiff_1);
-  IsVirtual = Builder.CreateIsNotNull(IsVirtual, "memptr.isvirtual");
+  llvm::Value *IsVirtual = Builder.CreateICmpSGE(OffsInVTable, llvm::ConstantInt::get(CGM.PtrDiffTy, 0), "memptr.isvirtual");
   Builder.CreateCondBr(IsVirtual, FnVirtual, FnNonVirtual);
 
   // In the virtual path, the adjustment left 'This' pointing to the
@@ -311,13 +303,15 @@ ItaniumCXXABI::EmitLoadOfMemberFunctionPointer(CodeGenFunction &CGF,
   CGF.EmitBlock(FnVirtual);
 
   // Cast the adjusted this to a pointer to vtable pointer and load.
+  Ptr = Builder.CreateBitCast(This, Builder.getInt8PtrTy());
+  Ptr = Builder.CreateInBoundsGEP(Ptr, FnAsInt);
+
   llvm::Type *VTableTy = Builder.getInt8PtrTy();
-  llvm::Value *VTable = Builder.CreateBitCast(This, VTableTy->getPointerTo());
+  llvm::Value *VTable = Builder.CreateBitCast(Ptr, VTableTy->getPointerTo());
   VTable = Builder.CreateLoad(VTable, "memptr.vtable");
 
   // Apply the offset.
-  llvm::Value *VTableOffset = FnAsInt;
-  if (!IsARM) VTableOffset = Builder.CreateSub(VTableOffset, ptrdiff_1);
+  llvm::Value *VTableOffset = OffsInVTable;
   VTable = Builder.CreateGEP(VTable, VTableOffset);
 
   // Load the virtual function to call.
@@ -427,20 +421,23 @@ ItaniumCXXABI::EmitMemberPointerConversion(CodeGenFunction &CGF,
   }
 
   // The this-adjustment is left-shifted by 1 on ARM.
-  if (IsARM) {
-    uint64_t offset = cast<llvm::ConstantInt>(adj)->getZExtValue();
-    offset <<= 1;
-    adj = llvm::ConstantInt::get(adj->getType(), offset);
-  }
+  // if (IsARM) {
+  //   uint64_t offset = cast<llvm::ConstantInt>(adj)->getZExtValue();
+  //   offset <<= 1;
+  //   adj = llvm::ConstantInt::get(adj->getType(), offset);
+  // }
 
-  llvm::Value *srcAdj = Builder.CreateExtractValue(src, 1, "src.adj");
+  // Treeki's CW/PPC mod:
+  //   Commented out ARM bit. Changed adj field index 1 to 0.
+
+  llvm::Value *srcAdj = Builder.CreateExtractValue(src, 0, "src.adj");
   llvm::Value *dstAdj;
   if (isDerivedToBase)
     dstAdj = Builder.CreateNSWSub(srcAdj, adj, "adj");
   else
     dstAdj = Builder.CreateNSWAdd(srcAdj, adj, "adj");
 
-  return Builder.CreateInsertValue(src, dstAdj, 1);
+  return Builder.CreateInsertValue(src, dstAdj, 0);
 }
 
 llvm::Constant *
@@ -475,20 +472,23 @@ ItaniumCXXABI::EmitMemberPointerConversion(const CastExpr *E,
   }
 
   // The this-adjustment is left-shifted by 1 on ARM.
-  if (IsARM) {
-    uint64_t offset = cast<llvm::ConstantInt>(adj)->getZExtValue();
-    offset <<= 1;
-    adj = llvm::ConstantInt::get(adj->getType(), offset);
-  }
+  // if (IsARM) {
+  //   uint64_t offset = cast<llvm::ConstantInt>(adj)->getZExtValue();
+  //   offset <<= 1;
+  //   adj = llvm::ConstantInt::get(adj->getType(), offset);
+  // }
 
-  llvm::Constant *srcAdj = llvm::ConstantExpr::getExtractValue(src, 1);
+  // Treeki's CW/PPC mod:
+  //   Commented out ARM bit. Changed adj field index 1 to 0.
+
+  llvm::Constant *srcAdj = llvm::ConstantExpr::getExtractValue(src, 0);
   llvm::Constant *dstAdj;
   if (isDerivedToBase)
     dstAdj = llvm::ConstantExpr::getNSWSub(srcAdj, adj);
   else
     dstAdj = llvm::ConstantExpr::getNSWAdd(srcAdj, adj);
 
-  return llvm::ConstantExpr::getInsertValue(src, dstAdj, 1);
+  return llvm::ConstantExpr::getInsertValue(src, dstAdj, 0);
 }
 
 llvm::Constant *
@@ -498,8 +498,11 @@ ItaniumCXXABI::EmitNullMemberPointer(const MemberPointerType *MPT) {
   if (MPT->isMemberDataPointer()) 
     return llvm::ConstantInt::get(CGM.PtrDiffTy, -1ULL, /*isSigned=*/true);
 
+  // Treeki's CW/PPC mod:
+  //   Added extra field.
+
   llvm::Constant *Zero = llvm::ConstantInt::get(CGM.PtrDiffTy, 0);
-  llvm::Constant *Values[2] = { Zero, Zero };
+  llvm::Constant *Values[3] = { Zero, Zero, Zero };
   return llvm::ConstantStruct::getAnon(Values);
 }
 
@@ -523,8 +526,11 @@ llvm::Constant *ItaniumCXXABI::BuildMemberPointer(const CXXMethodDecl *MD,
 
   CodeGenTypes &Types = CGM.getTypes();
 
+  // Treeki's CW/PPC mod: [RVT]
+  //   Lots of changes. As you may expect.
+
   // Get the function pointer (or index if this is a virtual function).
-  llvm::Constant *MemPtr[2];
+  llvm::Constant *MemPtr[3];
   if (MD->isVirtual()) {
     uint64_t Index = CGM.getVTableContext().getMethodVTableIndex(MD);
 
@@ -533,25 +539,39 @@ llvm::Constant *ItaniumCXXABI::BuildMemberPointer(const CXXMethodDecl *MD,
       Context.toCharUnitsFromBits(Context.getTargetInfo().getPointerWidth(0));
     uint64_t VTableOffset = (Index * PointerWidth.getQuantity());
 
-    if (IsARM) {
-      // ARM C++ ABI 3.2.1:
-      //   This ABI specifies that adj contains twice the this
-      //   adjustment, plus 1 if the member function is virtual. The
-      //   least significant bit of adj then makes exactly the same
-      //   discrimination as the least significant bit of ptr does for
-      //   Itanium.
-      MemPtr[0] = llvm::ConstantInt::get(CGM.PtrDiffTy, VTableOffset);
-      MemPtr[1] = llvm::ConstantInt::get(CGM.PtrDiffTy,
-                                         2 * ThisAdjustment.getQuantity() + 1);
-    } else {
-      // Itanium C++ ABI 2.3:
-      //   For a virtual function, [the pointer field] is 1 plus the
-      //   virtual table offset (in bytes) of the function,
-      //   represented as a ptrdiff_t.
-      MemPtr[0] = llvm::ConstantInt::get(CGM.PtrDiffTy, VTableOffset + 1);
-      MemPtr[1] = llvm::ConstantInt::get(CGM.PtrDiffTy,
-                                         ThisAdjustment.getQuantity());
+    // Find the VT ptr offset
+    CharUnits vtDiff = CharUnits::Zero();
+
+    const CXXRecordDecl *checkRD = MD->getParent()->getCanonicalDecl();
+    while (checkRD) {
+      if (checkRD->hasAttr<MoveVTableAttr>()) {
+        int v = checkRD->getAttr<MoveVTableAttr>()->getNewOffset();
+        vtDiff = CharUnits::fromQuantity(v);
+        break;
+      }
+
+      // Not dynamic.
+      if (!checkRD->isDynamicClass())
+        break;
+
+      // No bases.
+      if (checkRD->getNumBases() == 0)
+        break;
+
+      // Too many bases.
+      if (checkRD->getNumBases() > 1)
+        break;
+
+      // aaaaaaa
+      checkRD =
+      cast<CXXRecordDecl>(checkRD->bases_begin()->getType()->getAs<RecordType>()->getDecl());
     }
+
+    MemPtr[0] = llvm::ConstantInt::get(CGM.PtrDiffTy,
+                                       ThisAdjustment.getQuantity());
+    MemPtr[1] = llvm::ConstantInt::get(CGM.PtrDiffTy, VTableOffset);
+    MemPtr[2] = llvm::ConstantInt::get(CGM.PtrDiffTy, vtDiff.getQuantity());
+
   } else {
     const FunctionProtoType *FPT = MD->getType()->castAs<FunctionProtoType>();
     llvm::Type *Ty;
@@ -566,9 +586,10 @@ llvm::Constant *ItaniumCXXABI::BuildMemberPointer(const CXXMethodDecl *MD,
     }
     llvm::Constant *addr = CGM.GetAddrOfFunction(MD, Ty);
 
-    MemPtr[0] = llvm::ConstantExpr::getPtrToInt(addr, CGM.PtrDiffTy);
-    MemPtr[1] = llvm::ConstantInt::get(CGM.PtrDiffTy, (IsARM ? 2 : 1) *
+    MemPtr[0] = llvm::ConstantInt::get(CGM.PtrDiffTy, (IsARM ? 2 : 1) *
                                        ThisAdjustment.getQuantity());
+    MemPtr[1] = llvm::ConstantInt::get(CGM.PtrDiffTy, -1);
+    MemPtr[2] = llvm::ConstantExpr::getPtrToInt(addr, CGM.PtrDiffTy);
   }
   
   return llvm::ConstantStruct::getAnon(MemPtr);
@@ -620,53 +641,26 @@ ItaniumCXXABI::EmitMemberPointerComparison(CodeGenFunction &CGF,
   if (MPT->isMemberDataPointer())
     return Builder.CreateICmp(Eq, L, R);
 
-  // For member function pointers, the tautologies are more complex.
-  // The Itanium tautology is:
-  //   (L == R) <==> (L.ptr == R.ptr && (L.ptr == 0 || L.adj == R.adj))
-  // The ARM tautology is:
-  //   (L == R) <==> (L.ptr == R.ptr &&
-  //                  (L.adj == R.adj ||
-  //                   (L.ptr == 0 && ((L.adj|R.adj) & 1) == 0)))
-  // The inequality tautologies have exactly the same structure, except
-  // applying De Morgan's laws.
-  
-  llvm::Value *LPtr = Builder.CreateExtractValue(L, 0, "lhs.memptr.ptr");
-  llvm::Value *RPtr = Builder.CreateExtractValue(R, 0, "rhs.memptr.ptr");
+  // Treeki's CW/PPC mod:
+  //   Nuke all this fancy logic for something... simpler.
+  //   CW just compares the three values.
+  //   Now we do the same!
 
-  // This condition tests whether L.ptr == R.ptr.  This must always be
-  // true for equality to hold.
+  llvm::Value *LAdj = Builder.CreateExtractValue(L, 0, "lhs.memptr.adj");
+  llvm::Value *LVOffs = Builder.CreateExtractValue(L, 1, "lhs.memptr.voffs");
+  llvm::Value *LPtr = Builder.CreateExtractValue(L, 2, "lhs.memptr.ptr");
+  llvm::Value *RAdj = Builder.CreateExtractValue(R, 0, "rhs.memptr.adj");
+  llvm::Value *RVOffs = Builder.CreateExtractValue(R, 1, "rhs.memptr.voffs");
+  llvm::Value *RPtr = Builder.CreateExtractValue(R, 2, "rhs.memptr.ptr");
+
   llvm::Value *PtrEq = Builder.CreateICmp(Eq, LPtr, RPtr, "cmp.ptr");
-
-  // This condition, together with the assumption that L.ptr == R.ptr,
-  // tests whether the pointers are both null.  ARM imposes an extra
-  // condition.
-  llvm::Value *Zero = llvm::Constant::getNullValue(LPtr->getType());
-  llvm::Value *EqZero = Builder.CreateICmp(Eq, LPtr, Zero, "cmp.ptr.null");
-
-  // This condition tests whether L.adj == R.adj.  If this isn't
-  // true, the pointers are unequal unless they're both null.
-  llvm::Value *LAdj = Builder.CreateExtractValue(L, 1, "lhs.memptr.adj");
-  llvm::Value *RAdj = Builder.CreateExtractValue(R, 1, "rhs.memptr.adj");
+  llvm::Value *VOffsEq = Builder.CreateICmp(Eq, LVOffs, RVOffs, "cmp.voffs");
   llvm::Value *AdjEq = Builder.CreateICmp(Eq, LAdj, RAdj, "cmp.adj");
 
-  // Null member function pointers on ARM clear the low bit of Adj,
-  // so the zero condition has to check that neither low bit is set.
-  if (IsARM) {
-    llvm::Value *One = llvm::ConstantInt::get(LPtr->getType(), 1);
-
-    // Compute (l.adj | r.adj) & 1 and test it against zero.
-    llvm::Value *OrAdj = Builder.CreateOr(LAdj, RAdj, "or.adj");
-    llvm::Value *OrAdjAnd1 = Builder.CreateAnd(OrAdj, One);
-    llvm::Value *OrAdjAnd1EqZero = Builder.CreateICmp(Eq, OrAdjAnd1, Zero,
-                                                      "cmp.or.adj");
-    EqZero = Builder.CreateBinOp(And, EqZero, OrAdjAnd1EqZero);
-  }
-
   // Tie together all our conditions.
-  llvm::Value *Result = Builder.CreateBinOp(Or, EqZero, AdjEq);
-  Result = Builder.CreateBinOp(And, PtrEq, Result,
+  llvm::Value *TwoTogether = Builder.CreateBinOp(And, VOffsEq, AdjEq);
+  return Builder.CreateBinOp(And, PtrEq, TwoTogether,
                                Inequality ? "memptr.ne" : "memptr.eq");
-  return Result;
 }
 
 llvm::Value *
@@ -683,24 +677,21 @@ ItaniumCXXABI::EmitMemberPointerIsNotNull(CodeGenFunction &CGF,
     return Builder.CreateICmpNE(MemPtr, NegativeOne, "memptr.tobool");
   }
   
+  // Treeki's CW/PPC mod:
+  //   On CW, a ptmf is not null if any of the fields are non-zero.
   // In Itanium, a member function pointer is not null if 'ptr' is not null.
-  llvm::Value *Ptr = Builder.CreateExtractValue(MemPtr, 0, "memptr.ptr");
+
+  llvm::Value *Adj = Builder.CreateExtractValue(MemPtr, 0, "memptr.adj");
+  llvm::Value *VOffs = Builder.CreateExtractValue(MemPtr, 1, "memptr.voffs");
+  llvm::Value *Ptr = Builder.CreateExtractValue(MemPtr, 2, "memptr.ptr");
 
   llvm::Constant *Zero = llvm::ConstantInt::get(Ptr->getType(), 0);
-  llvm::Value *Result = Builder.CreateICmpNE(Ptr, Zero, "memptr.tobool");
 
-  // On ARM, a member function pointer is also non-null if the low bit of 'adj'
-  // (the virtual bit) is set.
-  if (IsARM) {
-    llvm::Constant *One = llvm::ConstantInt::get(Ptr->getType(), 1);
-    llvm::Value *Adj = Builder.CreateExtractValue(MemPtr, 1, "memptr.adj");
-    llvm::Value *VirtualBit = Builder.CreateAnd(Adj, One, "memptr.virtualbit");
-    llvm::Value *IsVirtual = Builder.CreateICmpNE(VirtualBit, Zero,
-                                                  "memptr.isvirtual");
-    Result = Builder.CreateOr(Result, IsVirtual);
-  }
+  llvm::Value *AdjNotNull = Builder.CreateICmpNE(Adj, Zero, "memptr.adj.notnull");
+  llvm::Value *VOffsNotNull = Builder.CreateICmpNE(VOffs, Zero, "memptr.voffs.notnull");
+  llvm::Value *PtrNotNull = Builder.CreateICmpNE(Ptr, Zero, "memptr.ptr.notnull");
 
-  return Result;
+  return Builder.CreateOr(Builder.CreateOr(AdjNotNull, VOffsNotNull), PtrNotNull);
 }
 
 /// The Itanium ABI requires non-zero initialization only for data
@@ -714,18 +705,10 @@ bool ItaniumCXXABI::isZeroInitializable(const MemberPointerType *MPT) {
 llvm::Value *ItaniumCXXABI::adjustToCompleteObject(CodeGenFunction &CGF,
                                                    llvm::Value *ptr,
                                                    QualType type) {
-  // Grab the vtable pointer as an intptr_t*.
-  llvm::Value *vtable = CGF.GetVTablePtr(ptr, CGF.IntPtrTy->getPointerTo());
-
-  // Track back to entry -2 and pull out the offset there.
-  llvm::Value *offsetPtr = 
-    CGF.Builder.CreateConstInBoundsGEP1_64(vtable, -2, "complete-offset.ptr");
-  llvm::LoadInst *offset = CGF.Builder.CreateLoad(offsetPtr);
-  offset->setAlignment(CGF.PointerAlignInBytes);
-
-  // Apply the offset.
-  ptr = CGF.Builder.CreateBitCast(ptr, CGF.Int8PtrTy);
-  return CGF.Builder.CreateInBoundsGEP(ptr, offset);
+  // Treeki's CW/PPC mod:
+  //   We can't implement this when the CW binary has RTTI off. GOODBYE.
+  ErrorUnsupportedABIWithoutFunction("adjustToCompleteObject not supported");
+  return 0;
 }
 
 llvm::Value *
@@ -759,17 +742,15 @@ void ItaniumCXXABI::BuildConstructorSignature(const CXXConstructorDecl *Ctor,
 
   // 'this' is already there.
 
-  // Check if we need to add a VTT parameter (which has type void **).
-  if (Type == Ctor_Base && Ctor->getParent()->getNumVBases() != 0)
-    ArgTys.push_back(Context.getPointerType(Context.VoidPtrTy));
-}
+  // Treeki's CW/PPC mod:
+  //   Say no to VTTs. Also, add return type.
 
-/// The ARM ABI does the same as the Itanium ABI, but returns 'this'.
-void ARMCXXABI::BuildConstructorSignature(const CXXConstructorDecl *Ctor,
-                                          CXXCtorType Type,
-                                          CanQualType &ResTy,
-                                SmallVectorImpl<CanQualType> &ArgTys) {
-  ItaniumCXXABI::BuildConstructorSignature(Ctor, Type, ResTy, ArgTys);
+  // Check if we need to add a VTT parameter (which has type void **).
+  if (Type == Ctor_Base && Ctor->getParent()->getNumVBases() != 0) {
+    // ArgTys.push_back(Context.getPointerType(Context.VoidPtrTy));
+    ErrorUnsupportedABIWithoutFunction("VTTs not supported");
+  }
+
   ResTy = ArgTys[0];
 }
 
@@ -783,21 +764,18 @@ void ItaniumCXXABI::BuildDestructorSignature(const CXXDestructorDecl *Dtor,
 
   // 'this' is already there.
 
+  // Treeki's CW/PPC mod:
+  //   Say no to VTTs.
+  //   Also, add the implicit dtor param. And the return of this.
+
   // Check if we need to add a VTT parameter (which has type void **).
-  if (Type == Dtor_Base && Dtor->getParent()->getNumVBases() != 0)
-    ArgTys.push_back(Context.getPointerType(Context.VoidPtrTy));
-}
+  if (Type == Dtor_Base && Dtor->getParent()->getNumVBases() != 0) {
+    // ArgTys.push_back(Context.getPointerType(Context.VoidPtrTy));
+    ErrorUnsupportedABIWithoutFunction("VTTs not supported");
+  }
 
-/// The ARM ABI does the same as the Itanium ABI, but returns 'this'
-/// for non-deleting destructors.
-void ARMCXXABI::BuildDestructorSignature(const CXXDestructorDecl *Dtor,
-                                         CXXDtorType Type,
-                                         CanQualType &ResTy,
-                                SmallVectorImpl<CanQualType> &ArgTys) {
-  ItaniumCXXABI::BuildDestructorSignature(Dtor, Type, ResTy, ArgTys);
-
-  if (Type != Dtor_Deleting)
-    ResTy = ArgTys[0];
+  ArgTys.push_back(Context.IntTy);
+  ResTy = ArgTys[0];
 }
 
 void ItaniumCXXABI::BuildInstanceFunctionParams(CodeGenFunction &CGF,
@@ -809,24 +787,27 @@ void ItaniumCXXABI::BuildInstanceFunctionParams(CodeGenFunction &CGF,
   const CXXMethodDecl *MD = cast<CXXMethodDecl>(CGF.CurGD.getDecl());
   assert(MD->isInstance());
 
+  // Treeki's CW/PPC mod:
+  //   Say no to VTTs.
+  //   Add the implicit param for dtors.
+  //   Also, the return of 'this' if we need it.
+
   // Check if we need a VTT parameter as well.
   if (CodeGenVTables::needsVTTParameter(CGF.CurGD)) {
+    ErrorUnsupportedABI(CGF, "VTTs not supported");
+  }
+
+  if (isa<CXXDestructorDecl>(MD)) {
     ASTContext &Context = getContext();
 
-    // FIXME: avoid the fake decl
-    QualType T = Context.getPointerType(Context.VoidPtrTy);
-    ImplicitParamDecl *VTTDecl
-      = ImplicitParamDecl::Create(Context, 0, MD->getLocation(),
-                                  &Context.Idents.get("vtt"), T);
-    Params.push_back(VTTDecl);
-    getVTTDecl(CGF) = VTTDecl;
+    ImplicitParamDecl *ShouldDelete
+      = ImplicitParamDecl::Create(Context, 0,
+                                  CGF.CurGD.getDecl()->getLocation(),
+                                  &Context.Idents.get("should_call_delete"),
+                                  Context.IntTy);
+    Params.push_back(ShouldDelete);
+    getStructorImplicitParamDecl(CGF) = ShouldDelete;
   }
-}
-
-void ARMCXXABI::BuildInstanceFunctionParams(CodeGenFunction &CGF,
-                                            QualType &ResTy,
-                                            FunctionArgList &Params) {
-  ItaniumCXXABI::BuildInstanceFunctionParams(CGF, ResTy, Params);
 
   // Return 'this' from certain constructors and destructors.
   if (HasThisReturn(CGF.CurGD))
@@ -837,21 +818,21 @@ void ItaniumCXXABI::EmitInstanceFunctionProlog(CodeGenFunction &CGF) {
   /// Initialize the 'this' slot.
   EmitThisParam(CGF);
 
-  /// Initialize the 'vtt' slot if needed.
-  if (getVTTDecl(CGF)) {
-    getVTTValue(CGF)
-      = CGF.Builder.CreateLoad(CGF.GetAddrOfLocalVar(getVTTDecl(CGF)),
-                               "vtt");
-  }
-}
-
-void ARMCXXABI::EmitInstanceFunctionProlog(CodeGenFunction &CGF) {
-  ItaniumCXXABI::EmitInstanceFunctionProlog(CGF);
+  // Treeki's CW/PPC mod:
+  //   Say no to VTTs.
+  //   Also, port over this return from ARM.
 
   /// Initialize the return slot to 'this' at the start of the
   /// function.
   if (HasThisReturn(CGF.CurGD))
     CGF.Builder.CreateStore(getThisValue(CGF), CGF.ReturnValue);
+
+  if (getStructorImplicitParamDecl(CGF)) {
+    getStructorImplicitParamValue(CGF)
+    = CGF.Builder.CreateLoad(
+      CGF.GetAddrOfLocalVar(getStructorImplicitParamDecl(CGF)),
+      "should_call_delete");
+  }
 }
 
 llvm::Value *ItaniumCXXABI::EmitConstructorCall(CodeGenFunction &CGF,
@@ -861,14 +842,15 @@ llvm::Value *ItaniumCXXABI::EmitConstructorCall(CodeGenFunction &CGF,
                                         llvm::Value *This,
                                         CallExpr::const_arg_iterator ArgBeg,
                                         CallExpr::const_arg_iterator ArgEnd) {
-  llvm::Value *VTT = CGF.GetVTTParameter(GlobalDecl(D, Type), ForVirtualBase,
-                                         Delegating);
-  QualType VTTTy = getContext().getPointerType(getContext().VoidPtrTy);
+
+  // Treeki's CW/PPC mod:
+  //   Say no to VTTs.
+
   llvm::Value *Callee = CGM.GetAddrOfCXXConstructor(D, Type);
 
   // FIXME: Provide a source location here.
   CGF.EmitCXXMemberCall(D, SourceLocation(), Callee, ReturnValueSlot(), This,
-                        VTT, VTTTy, ArgBeg, ArgEnd);
+                        0, QualType(), ArgBeg, ArgEnd);
   return Callee;
 }
 
@@ -881,12 +863,20 @@ RValue ItaniumCXXABI::EmitVirtualDestructorCall(CodeGenFunction &CGF,
   assert(DtorType == Dtor_Deleting || DtorType == Dtor_Complete);
 
   const CGFunctionInfo *FInfo
-    = &CGM.getTypes().arrangeCXXDestructor(Dtor, DtorType);
+    = &CGM.getTypes().arrangeCXXDestructor(Dtor, Dtor_Complete);
   llvm::Type *Ty = CGF.CGM.getTypes().GetFunctionType(*FInfo);
-  llvm::Value *Callee = CGF.BuildVirtualCall(Dtor, DtorType, This, Ty);
+  llvm::Value *Callee = CGF.BuildVirtualCall(Dtor, Dtor_Complete, This, Ty);
+
+  // Treeki's CW/PPC mod:
+  //   Say no to VTTs. Also, add the implicit dtor param.
+  //   I also changed DtorType param to Dtor_Complete in the two above
+  //   methods.
+
+  int iParamValue = (DtorType == Dtor_Deleting) ? 1 : -1;
+  llvm::Value *ImplicitParam = llvm::ConstantInt::get(CGM.IntTy, iParamValue);
 
   return CGF.EmitCXXMemberCall(Dtor, CallLoc, Callee, ReturnValue, This,
-                               /*ImplicitParam=*/0, QualType(), 0, 0);
+                               ImplicitParam, getContext().IntTy, 0, 0);
 }
 
 void ItaniumCXXABI::EmitVirtualInheritanceTables(
@@ -1227,11 +1217,10 @@ static void emitGlobalDtorWithCXAAtExit(CodeGenFunction &CGF,
                                         llvm::Constant *dtor,
                                         llvm::Constant *addr,
                                         bool TLS) {
-  const char *Name = "__cxa_atexit";
-  if (TLS) {
-    const llvm::Triple &T = CGF.getTarget().getTriple();
-    Name = T.isMacOSX() ?  "_tlv_atexit" : "__cxa_thread_atexit";
-  }
+  // Treeki's CW/PPC mod:
+  //   Lots of changes.
+
+  const char *Name = "__register_global_object";
 
   // We're assuming that the destructor function is something we can
   // reasonably call with the default CC.  Go ahead and cast it to the
@@ -1239,24 +1228,31 @@ static void emitGlobalDtorWithCXAAtExit(CodeGenFunction &CGF,
   llvm::Type *dtorTy =
     llvm::FunctionType::get(CGF.VoidTy, CGF.Int8PtrTy, false)->getPointerTo();
 
-  // extern "C" int __cxa_atexit(void (*f)(void *), void *p, void *d);
-  llvm::Type *paramTys[] = { dtorTy, CGF.Int8PtrTy, CGF.Int8PtrTy };
+  // extern "C" void __register_global_object(void *p, void (*f)(void *), void *block);
+  llvm::Type *paramTys[] = { CGF.Int8PtrTy, dtorTy, CGF.Int8PtrTy };
   llvm::FunctionType *atexitTy =
-    llvm::FunctionType::get(CGF.IntTy, paramTys, false);
+    llvm::FunctionType::get(CGF.VoidTy, paramTys, false);
 
   // Fetch the actual function.
   llvm::Constant *atexit = CGF.CGM.CreateRuntimeFunction(atexitTy, Name);
   if (llvm::Function *fn = dyn_cast<llvm::Function>(atexit))
     fn->setDoesNotThrow();
 
-  // Create a variable that binds the atexit to this shared object.
-  llvm::Constant *handle =
-    CGF.CGM.CreateRuntimeVariable(CGF.Int8Ty, "__dso_handle");
+  // Create the struct CodeWarrior's __register_global_object
+  // requires for each object.
+  llvm::Type *handleType = llvm::StructType::get(CGF.CGM.PtrDiffTy, CGF.CGM.PtrDiffTy, CGF.CGM.PtrDiffTy, NULL);
+  llvm::Constant *handle = CGF.CGM.CreateRuntimeVariable(handleType, "");
+  llvm::GlobalVariable *hGV = cast<llvm::GlobalVariable>(handle);
+
+  hGV->setExternallyInitialized(false);
+  hGV->setAlignment(4);
+  hGV->setLinkage(llvm::GlobalValue::PrivateLinkage);
+  hGV->setInitializer(llvm::ConstantAggregateZero::get(handleType));
 
   llvm::Value *args[] = {
-    llvm::ConstantExpr::getBitCast(dtor, dtorTy),
     llvm::ConstantExpr::getBitCast(addr, CGF.Int8PtrTy),
-    handle
+    llvm::ConstantExpr::getBitCast(dtor, dtorTy),
+    llvm::ConstantExpr::getBitCast(handle, CGF.Int8PtrTy)
   };
   CGF.EmitNounwindRuntimeCall(atexit, args);
 }
@@ -1266,8 +1262,11 @@ void ItaniumCXXABI::registerGlobalDtor(CodeGenFunction &CGF,
                                        const VarDecl &D,
                                        llvm::Constant *dtor,
                                        llvm::Constant *addr) {
+  // Treeki's CW/PPC mod:
+  //   ALWAYS use the CXA atexit function (which I modded)
+
   // Use __cxa_atexit if available.
-  if (CGM.getCodeGenOpts().CXAAtExit)
+  // if (CGM.getCodeGenOpts().CXAAtExit)
     return emitGlobalDtorWithCXAAtExit(CGF, dtor, addr, D.getTLSKind());
 
   if (D.getTLSKind())

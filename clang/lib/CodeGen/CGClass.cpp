@@ -349,7 +349,11 @@ namespace {
         CGF.GetAddressOfDirectBaseInCompleteClass(CGF.LoadCXXThis(),
                                                   DerivedClass, BaseClass,
                                                   BaseIsVirtual);
-      CGF.EmitCXXDestructorCall(D, Dtor_Base, BaseIsVirtual,
+
+      // Treeki's CW/PPC mod:
+      //   Don't delegate to the Base dtor. We're using Complete
+      //   as the canonical dtor.
+      CGF.EmitCXXDestructorCall(D, Dtor_Complete, BaseIsVirtual,
                                 /*Delegating=*/false, Addr);
     }
   };
@@ -697,15 +701,19 @@ void CodeGenFunction::EmitConstructorBody(FunctionArgList &Args) {
   const CXXConstructorDecl *Ctor = cast<CXXConstructorDecl>(CurGD.getDecl());
   CXXCtorType CtorType = CurGD.getCtorType();
 
+  // Treeki's CW/PPC mod:
+  //   Don't delegate to base. We're using the complete ctor as
+  //   the canonical one.
+
   // Before we go any further, try the complete->base constructor
   // delegation optimization.
-  if (CtorType == Ctor_Complete && IsConstructorDelegationValid(Ctor) &&
-      CGM.getTarget().getCXXABI().hasConstructorVariants()) {
-    if (CGDebugInfo *DI = getDebugInfo()) 
-      DI->EmitLocation(Builder, Ctor->getLocEnd());
-    EmitDelegateCXXConstructorCall(Ctor, Ctor_Base, Args);
-    return;
-  }
+  // if (CtorType == Ctor_Complete && IsConstructorDelegationValid(Ctor) &&
+  //     CGM.getTarget().getCXXABI().hasConstructorVariants()) {
+  //   if (CGDebugInfo *DI = getDebugInfo()) 
+  //     DI->EmitLocation(Builder, Ctor->getLocEnd());
+  //   EmitDelegateCXXConstructorCall(Ctor, Ctor_Base, Args);
+  //   return;
+  // }
 
   Stmt *Body = Ctor->getBody();
 
@@ -1243,13 +1251,11 @@ void CodeGenFunction::EmitDestructorBody(FunctionArgList &Args) {
   // outside of the function-try-block, which means it's always
   // possible to delegate the destructor body to the complete
   // destructor.  Do so.
-  if (DtorType == Dtor_Deleting) {
-    EnterDtorCleanups(Dtor, Dtor_Deleting);
-    EmitCXXDestructorCall(Dtor, Dtor_Complete, /*ForVirtualBase=*/false,
-                          /*Delegating=*/false, LoadCXXThis());
-    PopCleanupBlock();
-    return;
-  }
+
+  // Treeki's CW/PPC mod:
+  //   ALWAYS include delete code...!
+
+  EnterDtorCleanups(Dtor, Dtor_Deleting);
 
   Stmt *Body = Dtor->getBody();
 
@@ -1273,13 +1279,9 @@ void CodeGenFunction::EmitDestructorBody(FunctionArgList &Args) {
     // Enter the cleanup scopes for virtual bases.
     EnterDtorCleanups(Dtor, Dtor_Complete);
 
-    if (!isTryBody &&
-        CGM.getTarget().getCXXABI().hasDestructorVariants()) {
-      EmitCXXDestructorCall(Dtor, Dtor_Base, /*ForVirtualBase=*/false,
-                            /*Delegating=*/false, LoadCXXThis());
-      break;
-    }
-    // Fallthrough: act like we're in the base variant.
+    // Treeki's CW/PPC mod:
+    //   Don't delegate to the Base dtor. In our case, we're using
+    //   Complete as the "canonical" dtor, and Base is never generated.
       
   case Dtor_Base:
     // Enter the cleanup scopes for fields and non-virtual bases.
@@ -1354,8 +1356,10 @@ namespace {
     void Emit(CodeGenFunction &CGF, Flags flags) {
       llvm::BasicBlock *callDeleteBB = CGF.createBasicBlock("dtor.call_delete");
       llvm::BasicBlock *continueBB = CGF.createBasicBlock("dtor.continue");
+      // Treeki's CW/PPC mod:
+      //   Change IsNull to IsLe zero.
       llvm::Value *ShouldCallDelete
-        = CGF.Builder.CreateIsNull(ShouldDeleteCondition);
+        = CGF.Builder.CreateICmpSLE(ShouldDeleteCondition, llvm::ConstantInt::get(ShouldDeleteCondition->getType(), 0));
       CGF.Builder.CreateCondBr(ShouldCallDelete, continueBB, callDeleteBB);
 
       CGF.EmitBlock(callDeleteBB);
@@ -1823,9 +1827,14 @@ void CodeGenFunction::EmitCXXDestructorCall(const CXXDestructorDecl *DD,
   if (!Callee)
     Callee = CGM.GetAddrOfCXXDestructor(DD, Type);
   
+  // Treeki's CW/PPC mod:
+  //   Removed VTT. Added the implicit dtor param.
+  int iParamValue = (Type == Dtor_Deleting) ? 1 : -1;
+  llvm::Value *ImplicitParam = llvm::ConstantInt::get(CGM.IntTy, iParamValue);
+
   // FIXME: Provide a source location here.
   EmitCXXMemberCall(DD, SourceLocation(), Callee, ReturnValueSlot(), This,
-                    VTT, getContext().getPointerType(getContext().VoidPtrTy),
+                    ImplicitParam, getContext().IntTy,
                     0, 0);
   if (CGM.getCXXABI().HasThisReturn(CurGD) &&
       CGM.getCXXABI().HasThisReturn(GlobalDecl(DD, Type)))
@@ -1910,6 +1919,43 @@ CodeGenFunction::InitializeVTablePointer(BaseSubobject Base,
   } else {
     // We can just use the base offset in the complete class.
     NonVirtualOffset = Base.getBaseOffset();
+    // Treeki's CW/PPC mod: [RVT, TODO]
+    //   Move vtable pointer.
+
+    // We need to find out which base class defines the vtable, so we
+    //   can know if it gets moved or not. Fun, right...?
+
+    // TODO: This would be much nicer if I stored the info into
+    //   ASTRecordLayout, and pulled it from there for here.
+    //   I can get one with getContext().getASTRecordLayout()
+
+    llvm::errs() << "Loading vtable ptr for " << RD->getName() << " from\n";
+
+    const CXXRecordDecl *checkRD = RD;
+    while (checkRD) {
+      if (checkRD->hasAttr<MoveVTableAttr>()) {
+        int v = checkRD->getAttr<MoveVTableAttr>()->getNewOffset();
+        NonVirtualOffset += CharUnits::fromQuantity(v);
+        llvm::errs() << "Found: " << v << "\n";
+        break;
+      }
+
+      // Not dynamic.
+      if (!checkRD->isDynamicClass())
+        break;
+
+      // No bases.
+      if (checkRD->getNumBases() == 0)
+        break;
+
+      // Too many bases.
+      if (checkRD->getNumBases() > 1)
+        break;
+
+      // aaaaaaa
+      checkRD =
+        cast<CXXRecordDecl>(checkRD->bases_begin()->getType()->getAs<RecordType>()->getDecl());
+    }
   }
   
   // Apply the offsets.
@@ -2009,6 +2055,64 @@ llvm::Value *CodeGenFunction::GetVTablePtr(llvm::Value *This,
                                            llvm::Type *Ty) {
   llvm::Value *VTablePtrSrc = Builder.CreateBitCast(This, Ty->getPointerTo());
   llvm::Instruction *VTable = Builder.CreateLoad(VTablePtrSrc, "vtable");
+
+  CGM.DecorateInstruction(VTable, CGM.getTBAAInfoForVTablePtr());
+  return VTable;
+}
+
+llvm::Value *CodeGenFunction::GetVTablePtr(const CXXRecordDecl *WhichDecl,
+                                           llvm::Value *This,
+                                           llvm::Type *Ty) {
+  // Treeki's CW/PPC mod: [RVT, TODO]
+  //   Move vtable pointer.
+
+  // We need to find out which base class defines the vtable, so we
+  //   can know if it gets moved or not. Fun, right...?
+
+  // TODO: This would be much nicer if I stored the info into
+  //   ASTRecordLayout, and pulled it from there for here.
+  //   I can get one with getContext().getASTRecordLayout()
+
+  // llvm::errs() << "Loading vtable ptr for " << WhichDecl->getName() << " from\n";
+
+  CharUnits vtDiff = CharUnits::Zero();
+
+  const CXXRecordDecl *checkRD = WhichDecl;
+  while (checkRD) {
+    if (checkRD->hasAttr<MoveVTableAttr>()) {
+      int v = checkRD->getAttr<MoveVTableAttr>()->getNewOffset();
+      vtDiff = CharUnits::fromQuantity(v);
+      // llvm::errs() << "Found: " << v << "\n";
+      break;
+    }
+
+    // Not dynamic.
+    if (!checkRD->isDynamicClass())
+      break;
+
+    // No bases.
+    if (checkRD->getNumBases() == 0)
+      break;
+
+    // Too many bases.
+    if (checkRD->getNumBases() > 1)
+      break;
+
+    // aaaaaaa
+    checkRD =
+      cast<CXXRecordDecl>(checkRD->bases_begin()->getType()->getAs<RecordType>()->getDecl());
+  }
+
+  if (!vtDiff.isZero()) {
+    llvm::Value *v = llvm::ConstantInt::get(PtrDiffTy,
+                                        vtDiff.getQuantity());
+    This = Builder.CreateBitCast(This, Int8PtrTy);
+    This = Builder.CreateInBoundsGEP(This, v, "add.ptr");
+  }
+
+  llvm::Value *VTablePtrSrc = Builder.CreateBitCast(This, Ty->getPointerTo());
+  llvm::Instruction *VTable = Builder.CreateLoad(VTablePtrSrc, "vtable");
+
   CGM.DecorateInstruction(VTable, CGM.getTBAAInfoForVTablePtr());
   return VTable;
 }

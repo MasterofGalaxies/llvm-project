@@ -1976,6 +1976,7 @@ static void handleUsedAttr(Sema &S, Decl *D, const AttributeList &Attr) {
 }
 
 static void handleConstructorAttr(Sema &S, Decl *D, const AttributeList &Attr) {
+  llvm::errs() << "Attr args:" << Attr.getNumArgs() << "\n";
   // check the attribute arguments.
   if (Attr.getNumArgs() > 1) {
     S.Diag(Attr.getLoc(), diag::err_attribute_too_many_arguments) << 1;
@@ -4728,6 +4729,38 @@ static void handleSelectAnyAttr(Sema &S, Decl *D, const AttributeList &Attr) {
                            Attr.getAttributeSpellingListIndex()));
 }
 
+static void handleMoveVtableAttr(Sema &S, Decl *D, const AttributeList &Attr) {
+  // check the attribute arguments.
+  llvm::errs() << "Attr args:" << Attr.getNumArgs() << "\n";
+  if (Attr.getNumArgs() != 1) {
+    S.Diag(Attr.getLoc(), diag::err_attribute_wrong_number_arguments) << 1;
+    return;
+  }
+
+  Expr *E = Attr.getArg(0);
+  llvm::APSInt Idx(32);
+  if (E->isTypeDependent() || E->isValueDependent() ||
+      !E->isIntegerConstantExpr(Idx, S.Context)) {
+    S.Diag(Attr.getLoc(), diag::err_attribute_argument_n_not_int)
+      << "move_vtable" << 1 << E->getSourceRange();
+    return;
+  }
+
+  uint64_t value = Idx.getZExtValue();
+
+  llvm::errs() << "MoveVT : " << value << " for " << cast<NamedDecl>(D)->getName();
+
+  if (!isa<CXXRecordDecl>(D)) {
+    S.Diag(Attr.getLoc(), diag::warn_attribute_wrong_decl_type)
+      << Attr.getName() << ExpectedClass;
+    return;
+  }
+
+  D->addAttr(::new (S.Context)
+             MoveVTableAttr(Attr.getRange(), S.Context, value,
+                            Attr.getAttributeSpellingListIndex()));
+}
+
 //===----------------------------------------------------------------------===//
 // Top Level Sema Entry Points
 //===----------------------------------------------------------------------===//
@@ -4746,6 +4779,7 @@ static void ProcessNonInheritableDeclAttr(Sema &S, Scope *scope, Decl *D,
 static void ProcessInheritableDeclAttr(Sema &S, Scope *scope, Decl *D,
                                        const AttributeList &Attr) {
   switch (Attr.getKind()) {
+  case AttributeList::AT_MoveVTable:  handleMoveVtableAttr(S, D, Attr); break;
   case AttributeList::AT_IBAction:    handleIBAction(S, D, Attr); break;
   case AttributeList::AT_IBOutlet:    handleIBOutlet(S, D, Attr); break;
   case AttributeList::AT_IBOutletCollection:

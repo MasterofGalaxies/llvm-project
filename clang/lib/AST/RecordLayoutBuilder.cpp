@@ -545,6 +545,11 @@ protected:
 
   EmptySubobjectMap *EmptySubobjects;
 
+  // Treeki's CW/PPC mod:
+  //   Added some bits.
+  CharUnits RVTMovedOffset;
+  const CXXRecordDecl *SaveCXXRD;
+
   /// Size - The current size of the record layout.
   uint64_t Size;
 
@@ -653,7 +658,9 @@ protected:
       PrimaryBaseIsVirtual(false),
       HasOwnVFPtr(false),
       VBPtrOffset(CharUnits::fromQuantity(-1)),
-      FirstNearlyEmptyVBase(0) { }
+      FirstNearlyEmptyVBase(0),
+      RVTMovedOffset(CharUnits::fromQuantity(-1)),
+      SaveCXXRD(0) { }
 
   /// Reset this RecordLayoutBuilder to a fresh state, using the given
   /// alignment as the initial alignment.  This is used for the
@@ -778,6 +785,8 @@ protected:
     return Context.toCharUnitsFromBits(Size); 
   }
   uint64_t getSizeInBits() const { return Size; }
+
+  void TryPlaceVTable();
 
   void setSize(CharUnits NewSize) { Size = Context.toBits(NewSize); }
   void setSize(uint64_t NewSize) { Size = NewSize; }
@@ -1009,12 +1018,48 @@ RecordLayoutBuilder::EnsureVTablePointerAlignment(CharUnits UnpackedBaseAlign) {
 }
 
 void
+RecordLayoutBuilder::TryPlaceVTable() {
+  // C++ only.
+  if (!SaveCXXRD)
+    return;
+
+  // If the offset is negative, we did it at the start.
+  if (RVTMovedOffset.isNegative())
+    return;
+
+  // If we have a vfptr, we've already done it.
+  if (HasOwnVFPtr)
+    return;
+
+  // ... and we might not even need a vtable at all.
+  if (!needsVFTable(SaveCXXRD))
+    return;
+
+  CharUnits curSize = getSize();
+  if (curSize > RVTMovedOffset) {
+    llvm::errs() << "WTF? We missed the RVTMovedOffset! Size = " << curSize.getQuantity() << "; RVTMovedOffset = " << RVTMovedOffset.getQuantity() << "\n";
+  } else if (curSize == RVTMovedOffset) {
+    llvm::errs() << "VTable placed!!\n";
+
+    CharUnits PtrWidth = 
+    Context.toCharUnitsFromBits(Context.getTargetInfo().getPointerWidth(0));
+    CharUnits PtrAlign = 
+    Context.toCharUnitsFromBits(Context.getTargetInfo().getPointerAlign(0));
+    EnsureVTablePointerAlignment(PtrAlign);
+    HasOwnVFPtr = true;
+    setSize(getSize() + PtrWidth);
+    setDataSize(getSize());
+  }
+}
+
+void
 RecordLayoutBuilder::LayoutNonVirtualBases(const CXXRecordDecl *RD) {
   // Then, determine the primary base class.
   DeterminePrimaryBase(RD);
 
   // Compute base subobject info.
   ComputeBaseSubobjectInfo(RD);
+
   
   // If we have a primary base class, lay it out.
   if (PrimaryBase) {
@@ -1044,15 +1089,19 @@ RecordLayoutBuilder::LayoutNonVirtualBases(const CXXRecordDecl *RD) {
   // If this class needs a vtable/vf-table and didn't get one from a
   // primary base, add it in now.
   } else if (needsVFTable(RD)) {
-    assert(DataSize == 0 && "Vtable pointer must be at offset zero!");
-    CharUnits PtrWidth = 
+    // Treeki's CW/PPC mod:
+    //   Skip this if we've got a forced location.
+    if (RVTMovedOffset.isNegative()) {
+      assert(DataSize == 0 && "Vtable pointer must be at offset zero!");
+      CharUnits PtrWidth = 
       Context.toCharUnitsFromBits(Context.getTargetInfo().getPointerWidth(0));
-    CharUnits PtrAlign = 
+      CharUnits PtrAlign = 
       Context.toCharUnitsFromBits(Context.getTargetInfo().getPointerAlign(0));
-    EnsureVTablePointerAlignment(PtrAlign);
-    HasOwnVFPtr = true;
-    setSize(getSize() + PtrWidth);
-    setDataSize(getSize());
+      EnsureVTablePointerAlignment(PtrAlign);
+      HasOwnVFPtr = true;
+      setSize(getSize() + PtrWidth);
+      setDataSize(getSize());
+    }
   }
 
   bool HasDirectVirtualBases = false;
@@ -1536,6 +1585,8 @@ CharUnits RecordLayoutBuilder::LayoutBase(const BaseSubobjectInfo *Base) {
       EmptySubobjects->CanPlaceBaseAtOffset(Base, CharUnits::Zero())) {
     setSize(std::max(getSize(), Layout.getSize()));
 
+    TryPlaceVTable();
+
     return CharUnits::Zero();
   }
 
@@ -1578,6 +1629,8 @@ CharUnits RecordLayoutBuilder::LayoutBase(const BaseSubobjectInfo *Base) {
 
   // Remember max struct/class alignment.
   UpdateAlignment(BaseAlign, UnpackedBaseAlign);
+
+  TryPlaceVTable();
 
   return Offset;
 }
@@ -1643,6 +1696,12 @@ void RecordLayoutBuilder::Layout(const RecordDecl *D) {
 }
 
 void RecordLayoutBuilder::Layout(const CXXRecordDecl *RD) {
+  SaveCXXRD = RD;
+
+  if (RD->hasAttr<MoveVTableAttr>()) {
+    MoveVTableAttr *attr = RD->getAttr<MoveVTableAttr>();
+    RVTMovedOffset = CharUnits::fromQuantity(attr->getNewOffset());
+  }
   InitializeLayout(RD);
 
   // Lay out the vtable and the non-virtual bases.
@@ -1728,122 +1787,19 @@ void RecordLayoutBuilder::Layout(const ObjCInterfaceDecl *D) {
 void RecordLayoutBuilder::LayoutFields(const RecordDecl *D) {
   // Layout each field, for now, just sequentially, respecting alignment.  In
   // the future, this will need to be tweakable by targets.
-  const FieldDecl *LastFD = 0;
+
+  // Treeki's CW/PPC mod:
+  //   screw ms_struct
+
   ZeroLengthBitfield = 0;
-  unsigned RemainingInAlignment = 0;
   for (RecordDecl::field_iterator Field = D->field_begin(),
        FieldEnd = D->field_end(); Field != FieldEnd; ++Field) {
-    if (IsMsStruct) {
-      FieldDecl *FD = *Field;
-      if (Context.ZeroBitfieldFollowsBitfield(FD, LastFD))
-        ZeroLengthBitfield = FD;
-      // Zero-length bitfields following non-bitfield members are
-      // ignored:
-      else if (Context.ZeroBitfieldFollowsNonBitfield(FD, LastFD))
-        continue;
-      // FIXME. streamline these conditions into a simple one.
-      else if (Context.BitfieldFollowsBitfield(FD, LastFD) ||
-               Context.BitfieldFollowsNonBitfield(FD, LastFD) ||
-               Context.NonBitfieldFollowsBitfield(FD, LastFD)) {
-        // 1) Adjacent bit fields are packed into the same 1-, 2-, or
-        // 4-byte allocation unit if the integral types are the same
-        // size and if the next bit field fits into the current
-        // allocation unit without crossing the boundary imposed by the
-        // common alignment requirements of the bit fields.
-        // 2) Establish a new alignment for a bitfield following
-        // a non-bitfield if size of their types differ.
-        // 3) Establish a new alignment for a non-bitfield following
-        // a bitfield if size of their types differ.
-        std::pair<uint64_t, unsigned> FieldInfo = 
-          Context.getTypeInfo(FD->getType());
-        uint64_t TypeSize = FieldInfo.first;
-        unsigned FieldAlign = FieldInfo.second;
-        // This check is needed for 'long long' in -m32 mode.
-        if (TypeSize > FieldAlign &&
-            (Context.hasSameType(FD->getType(), 
-                                Context.UnsignedLongLongTy) 
-             ||Context.hasSameType(FD->getType(), 
-                                   Context.LongLongTy)))
-          FieldAlign = TypeSize;
-        FieldInfo = Context.getTypeInfo(LastFD->getType());
-        uint64_t TypeSizeLastFD = FieldInfo.first;
-        unsigned FieldAlignLastFD = FieldInfo.second;
-        // This check is needed for 'long long' in -m32 mode.
-        if (TypeSizeLastFD > FieldAlignLastFD &&
-            (Context.hasSameType(LastFD->getType(), 
-                                Context.UnsignedLongLongTy)
-             || Context.hasSameType(LastFD->getType(), 
-                                    Context.LongLongTy)))
-          FieldAlignLastFD = TypeSizeLastFD;
-        
-        if (TypeSizeLastFD != TypeSize) {
-          if (RemainingInAlignment &&
-              LastFD && LastFD->isBitField() &&
-              LastFD->getBitWidthValue(Context)) {
-            // If previous field was a bitfield with some remaining unfilled
-            // bits, pad the field so current field starts on its type boundary.
-            uint64_t FieldOffset = 
-            getDataSizeInBits() - UnfilledBitsInLastByte;
-            uint64_t NewSizeInBits = RemainingInAlignment + FieldOffset;
-            setDataSize(llvm::RoundUpToAlignment(NewSizeInBits,
-                                                 Context.getTargetInfo().getCharAlign()));
-            setSize(std::max(getSizeInBits(), getDataSizeInBits()));
-            RemainingInAlignment = 0;
-          }
-          
-          uint64_t UnpaddedFieldOffset = 
-            getDataSizeInBits() - UnfilledBitsInLastByte;
-          FieldAlign = std::max(FieldAlign, FieldAlignLastFD);
-          
-          // The maximum field alignment overrides the aligned attribute.
-          if (!MaxFieldAlignment.isZero()) {
-            unsigned MaxFieldAlignmentInBits = 
-              Context.toBits(MaxFieldAlignment);
-            FieldAlign = std::min(FieldAlign, MaxFieldAlignmentInBits);
-          }
-          
-          uint64_t NewSizeInBits = 
-            llvm::RoundUpToAlignment(UnpaddedFieldOffset, FieldAlign);
-          setDataSize(llvm::RoundUpToAlignment(NewSizeInBits,
-                                               Context.getTargetInfo().getCharAlign()));
-          UnfilledBitsInLastByte = getDataSizeInBits() - NewSizeInBits;
-          setSize(std::max(getSizeInBits(), getDataSizeInBits()));
-        }
-        if (FD->isBitField()) {
-          uint64_t FieldSize = FD->getBitWidthValue(Context);
-          assert (FieldSize > 0 && "LayoutFields - ms_struct layout");
-          if (RemainingInAlignment < FieldSize)
-            RemainingInAlignment = TypeSize - FieldSize;
-          else
-            RemainingInAlignment -= FieldSize;
-        }
-      }
-      else if (FD->isBitField()) {
-        uint64_t FieldSize = FD->getBitWidthValue(Context);
-        std::pair<uint64_t, unsigned> FieldInfo = 
-          Context.getTypeInfo(FD->getType());
-        uint64_t TypeSize = FieldInfo.first;
-        RemainingInAlignment = TypeSize - FieldSize;
-      }
-      LastFD = FD;
-    }
-    else if (!Context.getTargetInfo().useBitFieldTypeAlignment() &&
+    if (!Context.getTargetInfo().useBitFieldTypeAlignment() &&
              Context.getTargetInfo().useZeroLengthBitfieldAlignment()) {             
       if (Field->isBitField() && Field->getBitWidthValue(Context) == 0)
         ZeroLengthBitfield = *Field;
     }
     LayoutField(*Field);
-  }
-  if (IsMsStruct && RemainingInAlignment &&
-      LastFD && LastFD->isBitField() && LastFD->getBitWidthValue(Context)) {
-    // If we ended a bitfield before the full length of the type then
-    // pad the struct out to the full length of the last type.
-    uint64_t FieldOffset = 
-      getDataSizeInBits() - UnfilledBitsInLastByte;
-    uint64_t NewSizeInBits = RemainingInAlignment + FieldOffset;
-    setDataSize(llvm::RoundUpToAlignment(NewSizeInBits,
-                                         Context.getTargetInfo().getCharAlign()));
-    setSize(std::max(getSizeInBits(), getDataSizeInBits()));
   }
 }
 
@@ -2171,6 +2127,8 @@ void RecordLayoutBuilder::LayoutField(const FieldDecl *D) {
 
   // Remember max struct/class alignment.
   UpdateAlignment(FieldAlign, UnpackedFieldAlign);
+
+  TryPlaceVTable();
 }
 
 void RecordLayoutBuilder::FinishLayout(const NamedDecl *D) {

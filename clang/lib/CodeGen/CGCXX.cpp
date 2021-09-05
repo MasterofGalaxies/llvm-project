@@ -173,29 +173,18 @@ bool CodeGenModule::TryEmitDefinitionAsAlias(GlobalDecl AliasDecl,
 }
 
 void CodeGenModule::EmitCXXConstructors(const CXXConstructorDecl *D) {
+  // Treeki's CW/PPC mod:
+  //   ONLY make a Complete ctor.
+
   // The constructor used for constructing this as a complete class;
   // constucts the virtual bases, then calls the base constructor.
-  if (!D->getParent()->isAbstract()) {
-    // We don't need to emit the complete ctor if the class is abstract.
-    EmitGlobal(GlobalDecl(D, Ctor_Complete));
-  }
-
-  // The constructor used for constructing this as a base class;
-  // ignores virtual bases.
-  if (getTarget().getCXXABI().hasConstructorVariants())
-    EmitGlobal(GlobalDecl(D, Ctor_Base));
+  EmitGlobal(GlobalDecl(D, Ctor_Complete));
 }
 
 void CodeGenModule::EmitCXXConstructor(const CXXConstructorDecl *ctor,
                                        CXXCtorType ctorType) {
-  // The complete constructor is equivalent to the base constructor
-  // for classes with no virtual bases.  Try to emit it as an alias.
-  if (getTarget().getCXXABI().hasConstructorVariants() &&
-      ctorType == Ctor_Complete &&
-      !ctor->getParent()->getNumVBases() &&
-      !TryEmitDefinitionAsAlias(GlobalDecl(ctor, Ctor_Complete),
-                                GlobalDecl(ctor, Ctor_Base)))
-    return;
+  // Treeki's CW/PPC mod:
+  //   Don't alias to Base ctors. We don't have that!
 
   const CGFunctionInfo &fnInfo =
     getTypes().arrangeCXXConstructorDeclaration(ctor, ctorType);
@@ -229,37 +218,18 @@ CodeGenModule::GetAddrOfCXXConstructor(const CXXConstructorDecl *ctor,
 }
 
 void CodeGenModule::EmitCXXDestructors(const CXXDestructorDecl *D) {
-  // The destructor in a virtual table is always a 'deleting'
-  // destructor, which calls the complete destructor and then uses the
-  // appropriate operator delete.
-  if (D->isVirtual())
-    EmitGlobal(GlobalDecl(D, Dtor_Deleting));
+  // Treeki's CW/PPC mod:
+  //   ONLY make a Complete dtor.
 
   // The destructor used for destructing this as a most-derived class;
   // call the base destructor and then destructs any virtual bases.
   EmitGlobal(GlobalDecl(D, Dtor_Complete));
-
-  // The destructor used for destructing this as a base class; ignores
-  // virtual bases.
-  EmitGlobal(GlobalDecl(D, Dtor_Base));
 }
 
 void CodeGenModule::EmitCXXDestructor(const CXXDestructorDecl *dtor,
                                       CXXDtorType dtorType) {
-  // The complete destructor is equivalent to the base destructor for
-  // classes with no virtual bases, so try to emit it as an alias.
-  if (dtorType == Dtor_Complete &&
-      !dtor->getParent()->getNumVBases() &&
-      !TryEmitDefinitionAsAlias(GlobalDecl(dtor, Dtor_Complete),
-                                GlobalDecl(dtor, Dtor_Base)))
-    return;
-
-  // The base destructor is equivalent to the base destructor of its
-  // base class if there is exactly one non-virtual base class with a
-  // non-trivial destructor, there are no fields with a non-trivial
-  // destructor, and the body of the destructor is trivial.
-  if (dtorType == Dtor_Base && !TryEmitBaseDestructorAsAlias(dtor))
-    return;
+  // Treeki's CW/PPC mod:
+  //   Don't alias to Base dtors. We don't have that!
 
   const CGFunctionInfo &fnInfo =
     getTypes().arrangeCXXDestructor(dtor, dtorType);
@@ -291,11 +261,12 @@ CodeGenModule::GetAddrOfCXXDestructor(const CXXDestructorDecl *dtor,
                                                       /*ForVTable=*/false));
 }
 
-static llvm::Value *BuildVirtualCall(CodeGenFunction &CGF, uint64_t VTableIndex, 
+static llvm::Value *BuildVirtualCall(const CXXMethodDecl *MD,
+                                     CodeGenFunction &CGF, uint64_t VTableIndex, 
                                      llvm::Value *This, llvm::Type *Ty) {
   Ty = Ty->getPointerTo()->getPointerTo();
   
-  llvm::Value *VTable = CGF.GetVTablePtr(This, Ty);
+  llvm::Value *VTable = CGF.GetVTablePtr(MD->getParent()->getCanonicalDecl(), This, Ty);
   llvm::Value *VFuncPtr = 
     CGF.Builder.CreateConstInBoundsGEP1_64(VTable, VTableIndex, "vfn");
   return CGF.Builder.CreateLoad(VFuncPtr);
@@ -307,7 +278,7 @@ CodeGenFunction::BuildVirtualCall(const CXXMethodDecl *MD, llvm::Value *This,
   MD = MD->getCanonicalDecl();
   uint64_t VTableIndex = CGM.getVTableContext().getMethodVTableIndex(MD);
   
-  return ::BuildVirtualCall(*this, VTableIndex, This, Ty);
+  return ::BuildVirtualCall(MD, *this, VTableIndex, This, Ty);
 }
 
 /// BuildVirtualCall - This routine is to support gcc's kext ABI making
@@ -388,6 +359,6 @@ CodeGenFunction::BuildVirtualCall(const CXXDestructorDecl *DD, CXXDtorType Type,
   uint64_t VTableIndex = 
     CGM.getVTableContext().getMethodVTableIndex(GlobalDecl(DD, Type));
 
-  return ::BuildVirtualCall(*this, VTableIndex, This, Ty);
+  return ::BuildVirtualCall(DD, *this, VTableIndex, This, Ty);
 }
 

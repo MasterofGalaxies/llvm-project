@@ -33,6 +33,15 @@ namespace {
 
 class CGRecordLayoutBuilder {
 public:
+  // Treeki's CW/PPC mod:
+  //   Added some bits.
+  CharUnits RVTMovedOffset;
+  const CXXRecordDecl *SaveCXXRD;
+  const ASTRecordLayout *SaveLayout;
+  bool AddedVTablePointer;
+
+  void TryPlaceVTable();
+
   /// FieldTypes - Holds the LLVM types that the struct is created from.
   /// 
   SmallVector<llvm::Type *, 16> FieldTypes;
@@ -193,10 +202,13 @@ private:
 
 public:
   CGRecordLayoutBuilder(CodeGenTypes &Types)
-    : BaseSubobjectType(0),
+    : AddedVTablePointer(false),
+      BaseSubobjectType(0),
       IsZeroInitializable(true), IsZeroInitializableAsBase(true),
       Packed(false), IsMsStruct(false),
-      Types(Types) { }
+      Types(Types),
+      RVTMovedOffset(CharUnits::fromQuantity(-1)),
+      SaveCXXRD(0) { }
 
   /// Layout - Will layout a RecordDecl.
   void Layout(const RecordDecl *D);
@@ -205,6 +217,13 @@ public:
 }
 
 void CGRecordLayoutBuilder::Layout(const RecordDecl *D) {
+  if ((SaveCXXRD = dyn_cast<CXXRecordDecl>(D))) {
+    if (D->hasAttr<MoveVTableAttr>()) {
+      MoveVTableAttr *attr = D->getAttr<MoveVTableAttr>();
+      RVTMovedOffset = CharUnits::fromQuantity(attr->getNewOffset());
+    }
+  }
+
   Alignment = Types.getContext().getASTRecordLayout(D).getAlignment();
   Packed = D->hasAttr<PackedAttr>();
   
@@ -219,6 +238,7 @@ void CGRecordLayoutBuilder::Layout(const RecordDecl *D) {
     return;
 
   // We weren't able to layout the struct. Try again with a packed struct
+  AddedVTablePointer = false;
   Packed = true;
   LastLaidOutBase.invalidate();
   NextFieldOffset = CharUnits::Zero();
@@ -440,6 +460,7 @@ bool CGRecordLayoutBuilder::LayoutField(const FieldDecl *D,
   AppendField(fieldOffsetInBytes, Ty);
 
   LastLaidOutBase.invalidate();
+  TryPlaceVTable();
   return true;
 }
 
@@ -559,6 +580,7 @@ bool CGRecordLayoutBuilder::LayoutBase(const CXXRecordDecl *base,
     return false;
 
   AppendField(baseOffset, subobjectType);
+  TryPlaceVTable();
   return true;
 }
 
@@ -651,6 +673,95 @@ CGRecordLayoutBuilder::LayoutVirtualBases(const CXXRecordDecl *RD,
   return true;
 }
 
+void
+CGRecordLayoutBuilder::TryPlaceVTable() {
+  // C++ only.
+  if (!SaveCXXRD)
+    return;
+
+  // If the offset is negative, we did it at the start.
+  if (RVTMovedOffset.isNegative())
+    return;
+
+  // If we have a vfptr, we've already done it.
+  if (AddedVTablePointer)
+    return;
+
+  // ... and we might not even need a vtable at all.
+  if (!SaveLayout->hasOwnVFPtr())
+    return;
+
+  CharUnits curSize = NextFieldOffset;
+  if (curSize > RVTMovedOffset) {
+    llvm::errs() << "[CG] WTF? We missed the RVTMovedOffset! Size = " << curSize.getQuantity() << "; RVTMovedOffset = " << RVTMovedOffset.getQuantity() << "\n";
+  } else if (curSize == RVTMovedOffset) {
+    llvm::errs() << "[CG] VTable placed!!\n";
+  } else {
+    // Don't place it yet
+    return;
+  }
+
+  AddedVTablePointer = true;
+
+  llvm::Type *FunctionType =
+  llvm::FunctionType::get(llvm::Type::getInt32Ty(Types.getLLVMContext()),
+                          /*isVarArg=*/true);
+  llvm::Type *VTableTy = FunctionType->getPointerTo()->getPointerTo();
+
+  // if (getTypeAlignment(VTableTy) > Alignment) {
+  //   // FIXME: Should we allow this to happen in Sema?
+  //   assert(!Packed && "Alignment is wrong even with packed struct!");
+  //   return false;
+  // }
+
+
+  // This bit was copy and pasted from LayoutField mercilessly
+  // uint64_t fieldOffset = NextFieldOffset.getQuantity();
+
+  CharUnits fieldOffsetInBytes = NextFieldOffset;
+    // = Types.getContext().toCharUnitsFromBits(fieldOffset);
+
+  // llvm::Type *Ty = Types.ConvertTypeForMem(VTableTy);
+  CharUnits typeAlignment = getTypeAlignment(VTableTy);
+  VTableTy->dump();
+  // llvm::errs() << "Field Offset: " << fieldOffset << "\n";
+  llvm::errs() << "Field Offset in Bytes: " << fieldOffsetInBytes.getQuantity() << "\n";
+  llvm::errs() << "Type Alignment: " << typeAlignment.getQuantity() << "\n";
+
+  // If the type alignment is larger then the struct alignment, we must use
+  // a packed struct.
+  if (typeAlignment > Alignment) {
+    assert(!Packed && "Alignment is wrong even with packed struct!");
+    llvm::errs() << "Failure\n";
+    return;
+  }
+
+  // Round up the field offset to the alignment of the field type.
+  CharUnits alignedNextFieldOffsetInBytes =
+    NextFieldOffset.RoundUpToAlignment(typeAlignment);
+
+  if (fieldOffsetInBytes < alignedNextFieldOffsetInBytes) {
+    // Try to resize the last base field.
+    if (ResizeLastBaseFieldIfNecessary(fieldOffsetInBytes)) {
+      alignedNextFieldOffsetInBytes = 
+        NextFieldOffset.RoundUpToAlignment(typeAlignment);
+    }
+  }
+
+  if (fieldOffsetInBytes < alignedNextFieldOffsetInBytes) {
+    assert(!Packed && "Could not place field even with packed struct!");
+    llvm::errs() << "More failure\n";
+    return;
+  }
+
+  AppendPadding(fieldOffsetInBytes, typeAlignment);
+
+  // Now append the field.
+  AppendField(fieldOffsetInBytes, VTableTy);
+
+  LastLaidOutBase.invalidate();
+}
+
 bool
 CGRecordLayoutBuilder::LayoutNonVirtualBases(const CXXRecordDecl *RD,
                                              const ASTRecordLayout &Layout) {
@@ -668,20 +779,26 @@ CGRecordLayoutBuilder::LayoutNonVirtualBases(const CXXRecordDecl *RD,
 
   // Otherwise, add a vtable / vf-table if the layout says to do so.
   } else if (Layout.hasOwnVFPtr()) {
-    llvm::Type *FunctionType =
+    // Treeki's CW/PPC mod:
+    //   Skip this if we've got a forced location.
+    if (RVTMovedOffset.isNegative()) {
+      AddedVTablePointer = true;
+
+      llvm::Type *FunctionType =
       llvm::FunctionType::get(llvm::Type::getInt32Ty(Types.getLLVMContext()),
                               /*isVarArg=*/true);
-    llvm::Type *VTableTy = FunctionType->getPointerTo();
+      llvm::Type *VTableTy = FunctionType->getPointerTo();
 
-    if (getTypeAlignment(VTableTy) > Alignment) {
-      // FIXME: Should we allow this to happen in Sema?
-      assert(!Packed && "Alignment is wrong even with packed struct!");
-      return false;
+      if (getTypeAlignment(VTableTy) > Alignment) {
+        // FIXME: Should we allow this to happen in Sema?
+        assert(!Packed && "Alignment is wrong even with packed struct!");
+        return false;
+      }
+
+      assert(NextFieldOffset.isZero() &&
+       "VTable pointer must come first!");
+      AppendField(CharUnits::Zero(), VTableTy->getPointerTo());
     }
-
-    assert(NextFieldOffset.isZero() &&
-           "VTable pointer must come first!");
-    AppendField(CharUnits::Zero(), VTableTy->getPointerTo());
   }
 
   // Layout the non-virtual bases.
@@ -757,6 +874,7 @@ bool CGRecordLayoutBuilder::LayoutFields(const RecordDecl *D) {
   assert(!Alignment.isZero() && "Did not set alignment!");
 
   const ASTRecordLayout &Layout = Types.getContext().getASTRecordLayout(D);
+  SaveLayout = &Layout;
 
   const CXXRecordDecl *RD = dyn_cast<CXXRecordDecl>(D);
   if (RD)

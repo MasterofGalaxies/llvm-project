@@ -39,8 +39,10 @@ public:
     TargetInfo::IntType PtrDiff = Target.getPtrDiffType(0);
     uint64_t Width = Target.getTypeWidth(PtrDiff);
     unsigned Align = Target.getTypeAlign(PtrDiff);
+    // Treeki's CW/PPC mod:
+    //   Added an extra field.
     if (MPT->getPointeeType()->isFunctionType())
-      Width = 2 * Width;
+      Width = 3 * Width;
     return std::make_pair(Width, Align);
   }
 

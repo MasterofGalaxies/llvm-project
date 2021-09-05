@@ -510,7 +510,10 @@ CodeGenFunction::EmitCXXConstructExpr(const CXXConstructExpr *E,
       // fall-through
 
      case CXXConstructExpr::CK_NonVirtualBase:
-      Type = Ctor_Base;
+      // Treeki's CW/PPC mod:
+      //   Changed Ctor_Base here to Ctor_Complete.
+      //   Because we're always using Complete.
+      Type = Ctor_Complete;
     }
     
     // Call the constructor.

@@ -144,6 +144,12 @@ class IgnoredAttr : Attr {
 // Attributes begin here
 //
 
+def MoveVTable : InheritableAttr {
+  let Spellings = [GNU<"move_vtable">, CXX11<"cw", "move_vtable">];
+  let Args = [IntArgument<"NewOffset">];
+  let Subjects = [Record];
+}
+
 def AddressSpace : Attr {
   let Spellings = [GNU<"address_space">];
   let Args = [IntArgument<"AddressSpace">];

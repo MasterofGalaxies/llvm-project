@@ -1141,10 +1141,8 @@ void VTableBuilder::ComputeThisAdjustments() {
     // Add it.
     VTableThunks[VTableIndex].This = ThisAdjustment;
 
-    if (isa<CXXDestructorDecl>(MD)) {
-      // Add an adjustment for the deleting destructor as well.
-      VTableThunks[VTableIndex + 1].This = ThisAdjustment;
-    }
+    // Treeki's CW/PPC mod:
+    //   No extra deleting dtor.
   }
 
   /// Clear the method info map.
@@ -1311,14 +1309,9 @@ VTableBuilder::AddMethod(const CXXMethodDecl *MD,
            "Destructor can't have return adjustment!");
 
     // FIXME: Should probably add a layer of abstraction for vtable generation.
-    if (!isMicrosoftABI()) {
-      // Add both the complete destructor and the deleting destructor.
-      Components.push_back(VTableComponent::MakeCompleteDtor(DD));
-      Components.push_back(VTableComponent::MakeDeletingDtor(DD));
-    } else {
-      // Add the scalar deleting destructor.
-      Components.push_back(VTableComponent::MakeDeletingDtor(DD));
-    }
+    // Treeki's CW/PPC mod:
+    //   Complete dtor only.
+    Components.push_back(VTableComponent::MakeCompleteDtor(DD));
   } else {
     // Add the return adjustment if necessary.
     if (!ReturnAdjustment.isEmpty())
@@ -1687,7 +1680,10 @@ VTableBuilder::LayoutPrimaryAndSecondaryVTables(BaseSubobject Base,
     // breaks the vftable layout. Just skip RTTI for now, can't mangle anyway.
   }
 
-  uint64_t AddressPoint = Components.size();
+  // Treeki's CW/PPC mod:
+  //   Subtract 2 from the AddressPoint because CW expects there to be
+  //   two bits of padding there.
+  uint64_t AddressPoint = Components.size() - 2;
 
   // Now go through all virtual member functions and add them.
   PrimaryBasesSetVectorTy PrimaryBases;
@@ -1704,15 +1700,10 @@ VTableBuilder::LayoutPrimaryAndSecondaryVTables(BaseSubobject Base,
       const MethodInfo &MI = I->second;
       if (const CXXDestructorDecl *DD = dyn_cast<CXXDestructorDecl>(MD)) {
         // FIXME: Should probably add a layer of abstraction for vtable generation.
-        if (!isMicrosoftABI()) {
-          MethodVTableIndices[GlobalDecl(DD, Dtor_Complete)]
-              = MI.VTableIndex - AddressPoint;
-          MethodVTableIndices[GlobalDecl(DD, Dtor_Deleting)]
-              = MI.VTableIndex + 1 - AddressPoint;
-        } else {
-          MethodVTableIndices[GlobalDecl(DD, Dtor_Deleting)]
-              = MI.VTableIndex - AddressPoint;
-        }
+        // Treeki's CW/PPC mod:
+        //   Complete dtor only.
+        MethodVTableIndices[GlobalDecl(DD, Dtor_Complete)]
+            = MI.VTableIndex - AddressPoint;
       } else {
         MethodVTableIndices[MD] = MI.VTableIndex - AddressPoint;
       }
@@ -2212,18 +2203,11 @@ void VTableBuilder::dumpLayout(raw_ostream& Out) {
                                   MD);
 
     if (const CXXDestructorDecl *DD = dyn_cast<CXXDestructorDecl>(MD)) {
-      // FIXME: Should add a layer of abstraction for vtable generation.
-      if (!isMicrosoftABI()) {
-        GlobalDecl GD(DD, Dtor_Complete);
-        assert(MethodVTableIndices.count(GD));
-        uint64_t VTableIndex = MethodVTableIndices[GD];
-        IndicesMap[VTableIndex] = MethodName + " [complete]";
-        IndicesMap[VTableIndex + 1] = MethodName + " [deleting]";
-      } else {
-        GlobalDecl GD(DD, Dtor_Deleting);
-        assert(MethodVTableIndices.count(GD));
-        IndicesMap[MethodVTableIndices[GD]] = MethodName + " [scalar deleting]";
-      }
+      // Treeki's CW/PPC mod:
+      //   Complete dtor only.
+      GlobalDecl GD(DD, Dtor_Complete);
+      assert(MethodVTableIndices.count(GD));
+      IndicesMap[MethodVTableIndices[GD]] = MethodName + " [complete]";
     } else {
       assert(MethodVTableIndices.count(MD));
       IndicesMap[MethodVTableIndices[MD]] = MethodName;

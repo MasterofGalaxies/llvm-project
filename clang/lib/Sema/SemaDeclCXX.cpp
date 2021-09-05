@@ -5888,8 +5888,11 @@ void Sema::CheckConstructor(CXXConstructorDecl *Constructor) {
 /// on error.
 bool Sema::CheckDestructor(CXXDestructorDecl *Destructor) {
   CXXRecordDecl *RD = Destructor->getParent();
+
+  // Treeki's CW/PPC mod:
+  //   All destructors need delete operators, not just virtual ones.
   
-  if (!Destructor->getOperatorDelete() && Destructor->isVirtual()) {
+  if (!Destructor->getOperatorDelete()) {
     SourceLocation Loc;
     
     if (!Destructor->isImplicit())

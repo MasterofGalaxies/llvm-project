@@ -1201,6 +1201,7 @@ public:
   /// GetVTablePtr - Return the Value of the vtable pointer member pointed
   /// to by This.
   llvm::Value *GetVTablePtr(llvm::Value *This, llvm::Type *Ty);
+  llvm::Value *GetVTablePtr(const CXXRecordDecl *WhichDecl, llvm::Value *This, llvm::Type *Ty);
 
   /// EnterDtorCleanups - Enter the cleanups necessary to complete the
   /// given phase of destruction for a destructor.  The end result
